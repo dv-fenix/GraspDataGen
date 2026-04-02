@@ -1021,3 +1021,34 @@ def transform_inverse_isaaclab_kernel(
     dst[tid+dst_start_idx][5] = inv[4]
     dst[tid+dst_start_idx][6] = inv[5]
    
+@wp.kernel
+def transform_kernel(
+    src_start_idx: int,
+    dst_start_idx: int,
+    src: wp.array(dtype=wp.transform),
+    dst: wp.array2d(dtype=wp.float32),   # [num_envs, 7]
+    output_is_lab: bool,
+):
+    tid = wp.tid()
+
+    t = src[tid + src_start_idx]
+    out_idx = tid + dst_start_idx
+
+    # position
+    dst[out_idx][0] = t[0]
+    dst[out_idx][1] = t[1]
+    dst[out_idx][2] = t[2]
+
+    # quaternion
+    # Warp transform storage is [qx, qy, qz, qw]
+    # Isaac Lab root pose expects [qw, qx, qy, qz]
+    if output_is_lab:
+        dst[out_idx][3] = t[6]  # qw
+        dst[out_idx][4] = t[3]  # qx
+        dst[out_idx][5] = t[4]  # qy
+        dst[out_idx][6] = t[5]  # qz
+    else:
+        dst[out_idx][3] = t[3]  # qx
+        dst[out_idx][4] = t[4]  # qy
+        dst[out_idx][5] = t[5]  # qz
+        dst[out_idx][6] = t[6]  # qw
