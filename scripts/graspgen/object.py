@@ -126,13 +126,22 @@ class ObjectConfig:
 
         # Then, override with command line arguments (highest priority)
         if grasp_file_args is not None:
-            object_file = grasp_file_args.object_file
-            object_scale = grasp_file_args.object_scale
-            obj2usd_use_existing_usd = grasp_file_args.obj2usd_use_existing_usd
-            obj2usd_collision_approximation = grasp_file_args.obj2usd_collision_approximation
-            obj2usd_friction = grasp_file_args.obj2usd_friction
+            def arg_explicit(attr, default_val):
+                """Return True if CLI arg differs from its parser default."""
+                return hasattr(grasp_file_args, attr) and getattr(grasp_file_args, attr) != default_val
+
+            if arg_explicit("object_file", default_object_file):
+                object_file = grasp_file_args.object_file
+            if arg_explicit("object_scale", default_object_scale):
+                object_scale = grasp_file_args.object_scale
+            if arg_explicit("obj2usd_use_existing_usd", default_obj2usd_use_existing_usd):
+                obj2usd_use_existing_usd = grasp_file_args.obj2usd_use_existing_usd
+            if arg_explicit("obj2usd_collision_approximation", default_obj2usd_collision_approximation):
+                obj2usd_collision_approximation = grasp_file_args.obj2usd_collision_approximation
+            if arg_explicit("obj2usd_friction", default_obj2usd_friction):
+                obj2usd_friction = grasp_file_args.obj2usd_friction
 
         return cls(object_file=object_file, object_scale=object_scale,
-                   obj2usd_use_existing_usd=obj2usd_use_existing_usd,
-                   obj2usd_collision_approximation=obj2usd_collision_approximation,
-                   obj2usd_friction=obj2usd_friction)
+                    obj2usd_use_existing_usd=obj2usd_use_existing_usd,
+                    obj2usd_collision_approximation=obj2usd_collision_approximation,
+                    obj2usd_friction=obj2usd_friction)
