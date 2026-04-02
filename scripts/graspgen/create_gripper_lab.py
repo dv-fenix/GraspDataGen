@@ -212,12 +212,12 @@ class GripperCreator:
             delta = upper_delta
             tool_pos = 0.5*wp.vec3f(gripper.data.body_com_pos_w[0, finger_idxs[1]] + gripper.data.body_com_pos_w[0, finger_idxs[0]])
         # delta is now finger1 - finger0 position in the open limit.  The largest delta is the open_axis.
-        open_axis = wp.argmax(wp.abs(delta))
+        open_axis = int(wp.argmax(wp.abs(delta)))
         if delta[open_axis] < 0.0:
             finger_idxs = finger_idxs[::-1]
         approach_delta = tool_pos - wp.vec3f(gripper.data.body_com_pos_w[0, gripper.body_names.index(self.config.base_frame)])
         approach_delta[open_axis] = 0.0
-        approach_axis = wp.argmax(wp.abs(approach_delta))
+        approach_axis = int(wp.argmax(wp.abs(approach_delta)))
         mid_axis = 3 - approach_axis - open_axis
         # MTC TODO if the approach axis delta is negative, then we use negaive normals when moving away form the object?
         return open_limit, approach_axis, open_axis, mid_axis, finger_idxs
