@@ -64,12 +64,19 @@ ENV VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json
 WORKDIR /isaac-sim
 ENV ACCEPT_EULA=Y
 
+# Choose a safe default; 1–4 is typical on 8–16GB hosts for this build.
+ARG ISAACSIM_JOBS=2
+
+# Optional: also cap any nested make/cmake invocations (defensive).
+ENV MAKEFLAGS="-j${ISAACSIM_JOBS}" \
+    CMAKE_BUILD_PARALLEL_LEVEL="${ISAACSIM_JOBS}"
+
 # Clone Isaac Sim repository with Git LFS support
 RUN git clone https://github.com/isaac-sim/IsaacSim.git . \
     && git lfs install \
     && git lfs pull \
     && mkdir -p /isaac-sim/.nvidia-omniverse/config \
-    && echo "yes" | ./build.sh 
+    && echo "yes" | ./build.sh --release -j "${ISAACSIM_JOBS}"
 RUN ln -s /isaac-sim/_build/linux-x86_64/release /isaacsim
 
 
