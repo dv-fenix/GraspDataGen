@@ -1219,3 +1219,26 @@ def transform_kernel(
         dst[out_idx][4] = t[4]  # qy
         dst[out_idx][5] = t[5]  # qz
         dst[out_idx][6] = t[6]  # qw
+
+@wp.kernel
+def set_is_success_from_translation_drift_kernel(
+    start_idx: wp.int32,
+    closed_rel_transforms: wp.array(dtype=wp.transform),
+    final_rel_transforms: wp.array(dtype=wp.transform),
+    translation_tol: wp.float32,
+    is_success: wp.array(dtype=wp.int32),
+):
+    tid = wp.tid()
+
+    t0 = closed_rel_transforms[start_idx + tid]
+    t1 = final_rel_transforms[start_idx + tid]
+
+    p0 = wp.vec3(t0[0], t0[1], t0[2])
+    p1 = wp.vec3(t1[0], t1[1], t1[2])
+
+    dist = wp.length(p1 - p0)
+
+    if dist <= translation_tol:
+        is_success[start_idx + tid] = 1
+    else:
+        is_success[start_idx + tid] = 0

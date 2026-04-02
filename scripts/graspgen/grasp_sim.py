@@ -20,6 +20,7 @@ from graspgen_utils import add_arg_to_group, save_yaml, print_green, add_isaac_l
 from gripper import add_gripper_args, collect_gripper_args, apply_gripper_configuration
 from object import add_object_args, collect_object_args, ObjectConfig
 import os
+from warp_kernels import set_is_success_from_translation_drift_kernel
 
 USE_ORIGIN_PLACEMENT = False
 
@@ -40,9 +41,11 @@ default_grasp_file_cspace_position = "{}"
 default_disable_sim = False
 default_record_pvd = False
 default_debug_single_index = 0
-default_output_failed_grasp_locations = False
+default_output_failed_grasp_locations = True
 default_flip_input_grasps = False
 default_enable_ccd = True
+default_joint_close_tol = 0.002      # radians or meters, depending on joint type
+default_max_close_duration = 2.0     # seconds
 
 def collect_grasp_sim_args(input_dict):
     desired_keys = [
@@ -241,6 +244,7 @@ class GraspSimBuffer:
         self.is_success = wp.zeros(shape=self.num_grasps, dtype=wp.int32, device=self.device)
         self.bite_points = wp.array(bite_points, dtype=wp.vec3, device=self.device)
         self.pregrasp_bite_points = wp.clone(self.bite_points, device=self.device)
+        self.closed_rel_transforms = wp.array(shape=self.num_grasps, dtype=wp.transform, device=self.device)
 
 class GraspingSimulationConfig:
     def __init__(self, max_num_envs, env_spacing, fps, force_magnitude, initial_grasp_duration,
@@ -420,9 +424,14 @@ class GraspingSimulation:
             grasp = valid_grasp_indices[i][1]
             grasp_idx_map[i] = valid_grasp_indices[i][0]
             # Extract position and orientation
-            position = np.array(grasp['position'])
-            orientation_xyz = np.array(grasp['orientation']['xyz'])
-            orientation_w = grasp['orientation']['w']
+            if self.config.start_with_pregrasp_cspace_position and 'pregrasp_position' in grasp and 'pregrasp_orientation' in grasp:
+                position = np.array(grasp['pregrasp_position'])
+                orientation_xyz = np.array(grasp['pregrasp_orientation']['xyz'])
+                orientation_w = grasp['pregrasp_orientation']['w']
+            else:
+                position = np.array(grasp['position'])
+                orientation_xyz = np.array(grasp['orientation']['xyz'])
+                orientation_w = grasp['orientation']['w']
             # wp.transforms are [x, y, z, qx, qy, qz, qw]
             if self.config.flip_input_grasps: #rotate the grasps for debugging
                 zrot=wp.quat(0.0,0.0,0.0, 0.0)
@@ -569,8 +578,11 @@ class GraspingSimulation:
             #is_suss_cpu = gsb.is_success.numpy().tolist()
             is_success = wp.to_torch(gsb.is_success)
             grasp_keys = list(isaac_grasp_data["grasps"].keys())
-            num_successes = 0
-            num_fails = 0
+            # Count over all simulated grasps
+            num_successes = int(torch.sum(is_success).item())
+            num_fails = int(gsb.num_grasps - num_successes)
+
+            # Choose which grasps to SAVE
             if (save_successes and not save_fails) or (not save_successes and save_fails):
                 env_ids = torch.where(is_success)[0] if save_successes else torch.where(~is_success)[0]
                 old_grasps = isaac_grasp_data["grasps"]
@@ -601,10 +613,6 @@ class GraspingSimulation:
                 
                 # confidence
                 confidence = float(is_success[env_id])
-                if confidence:
-                    num_successes += 1
-                else:
-                    num_fails += 1
                 grasp["confidence"] = confidence
                 grasp["pregrasp_position"] = copy.deepcopy(grasp["position"])
                 grasp["pregrasp_orientation"] = copy.deepcopy(grasp["orientation"])
@@ -782,13 +790,9 @@ class GraspingSimulation:
                 init_state=ArticulationCfg.InitialStateCfg(),#joint_pos={"finger_joint": -0.62},),
                 actuators={
                     "gripper": ImplicitActuatorCfg(
-                        joint_names_expr=[".*",],
-                        #effort_limit_sim=150.0,
-                        #velocity_limit_sim=2.175,
-                        #stiffness=400.0,
-                        #damping=40.0,
-                        stiffness=None,
-                        damping=None,
+                        joint_names_expr=[".*"],
+                        stiffness=4000.0,
+                        damping=200.0,
                     ),
                 },
             )
@@ -946,67 +950,67 @@ class GraspingSimulation:
     # When headed, keep rendering until window closes at the end of the batch (for debugging single grasps)
     def run_grasp_sim(self, start_idx, num_envs, buff, batch_count=None, total_batches=None):
         from graspgen_utils import get_simulation_app
-        simulation_app = get_simulation_app(__file__, force_headed=self.force_headed, wait_for_debugger_attach=self.wait_for_debugger_attach)
-        # Import Isaac Lab modules after ensuring Isaac Lab is started
+        simulation_app = get_simulation_app(
+            __file__,
+            force_headed=self.force_headed,
+            wait_for_debugger_attach=self.wait_for_debugger_attach,
+        )
+
         import isaaclab.sim as sim_utils
         from isaaclab.sim import build_simulation_context
         from isaaclab.scene import InteractiveScene
-        
-        # Setup PVD recording if needed (requires Isaac Lab to be started)
+
         self._setup_pvd_recording()
-        
-        # Initialize the simulation context with safer PhysX memory configuration
-        # Reduce large GPU allocations that may be contaminated by Isaac Sim 5.0
+
         sim_cfg = sim_utils.SimulationCfg(
-            device=self.config.device, # Set sim device seperate from config.device?
-            dt=1.0/self.config.fps,  # Set physics timestep based on FPS
+            device=self.config.device,
+            dt=1.0 / self.config.fps,
             physx=sim_utils.PhysxCfg(
                 min_position_iteration_count=64,
-                #min_velocity_iteration_count=0,
-                # Reduce from 2**30 (1GB) to 2**26 (64MB) to avoid contamination
-                #gpu_collision_stack_size=2**26,  # 64MB instead of 1GB
-                # Add explicit memory settings to prevent corruption
-                #gpu_max_rigid_contact_count=2**20,  # 1M contacts instead of default
-                gpu_max_rigid_patch_count=2**19,   # 512K patches instead of default
-                #gpu_found_lost_pairs_capacity=2**18,  # 256K pairs
-                #gpu_heap_capacity=2**24,  # 16MB heap
+                gpu_max_rigid_patch_count=2**19,
                 enable_ccd=self.config.enable_ccd if self.config.device == "cpu" else False,
-            )
+            ),
         )
-        with build_simulation_context(device=self.config.device, gravity_enabled = False, auto_add_lighting=True, sim_cfg=sim_cfg) as sim:
-            # build simulation context does some kit printing stuff that often leaves stdout in a bad print color state.
+
+        with build_simulation_context(
+            device=self.config.device,
+            gravity_enabled=False,
+            auto_add_lighting=True,
+            sim_cfg=sim_cfg,
+        ) as sim:
             print("\033[0m", end="")
             sim._app_control_on_stop_handle = None
 
-            # Set main camera to look at the first env
-            env_offset = ( math.sqrt(float(num_envs))/2.0 - 0.5)*self.config.env_spacing
-            sim.set_camera_view(eye=((env_offset-0.09488407096425105, -env_offset-0.4248694091778259, 0.4521177672484193)),
-                                target=(env_offset, -env_offset, 0.15))
-            
+            env_offset = (math.sqrt(float(num_envs)) / 2.0 - 0.5) * self.config.env_spacing
+            sim.set_camera_view(
+                eye=((env_offset - 0.09488407096425105, -env_offset - 0.4248694091778259, 0.4521177672484193)),
+                target=(env_offset, -env_offset, 0.15),
+            )
+
             scene_cfg = self.build_grasp_sim_scene_cfg(num_envs)
             scene = InteractiveScene(scene_cfg)
-            # this next line should match the collision filtering if logic, but not.
-            if not((not scene.cfg.replicate_physics and scene.cfg.filter_collisions) or (int(self.kit_major_version) >= 107 and scene.device == "cpu")):
-                # when cpu the scene is already filtered by the InteractiveScene constructor
+
+            if not (
+                (not scene.cfg.replicate_physics and scene.cfg.filter_collisions)
+                or (int(self.kit_major_version) >= 107 and scene.device == "cpu")
+            ):
                 scene.filter_collisions()
+
             run_start_time = time.time()
             sim.reset()
-            
-            do_render = not simulation_app.DEFAULT_LAUNCHER_CONFIG['headless']
-            # Get scene entities
+
+            do_render = not simulation_app.DEFAULT_LAUNCHER_CONFIG["headless"]
+
             gripper = scene["gripper"]
             object = scene["object"]
-            contact_forces0 = scene["contact_forces0"]
-            contact_forces1 = scene["contact_forces1"]
-            
-            # Define simulation stepping
+
             sim_dt = sim.get_physics_dt()
             sim_time = 0.0
-            
-            initial_grasp_duration = self.config.initial_grasp_duration  # seconds for initial grasp
-            grasp_start_time = 0.0
-            force_start_time = grasp_start_time + initial_grasp_duration
-            
+
+            close_duration = self.config.initial_grasp_duration
+            force_start_time = close_duration
+            force_end_time = force_start_time
+
             if not (self.open_limit == "upper" or self.open_limit == "lower"):
                 print_red(f"Invalid open limit: {self.open_limit}")
             grasp_mode = 0 if self.open_limit == "upper" else 1
@@ -1016,35 +1020,38 @@ class GraspingSimulation:
             _, gravity_mag = sim.get_physics_context().get_gravity()
             acceleration = Gs * gravity_mag
             force_magnitude = acceleration * object.data.default_mass[0]
-            
-            # Create force tensors for each sequence
-            # TODO Move this to only be done once in validate_grasps, or validate_config?
+
             world_forces = {}
             wp_world_forces = {}
-            force_end_time = force_start_time
             for i, (duration, direction, scale) in enumerate(self.tug_sequences):
                 force_end_time += duration
                 force = torch.zeros(num_envs, 3, device=self.config.device)
-                world_force = [direction[0] * force_magnitude * scale, direction[1] * force_magnitude * scale, direction[2] * force_magnitude * scale]
+                world_force = [
+                    direction[0] * force_magnitude * scale,
+                    direction[1] * force_magnitude * scale,
+                    direction[2] * force_magnitude * scale,
+                ]
                 wp_world_forces[i] = wp.vec3(world_force[0], world_force[1], world_force[2])
                 force[:, 0] = world_force[0]
                 force[:, 1] = world_force[1]
                 force[:, 2] = world_force[2]
                 world_forces[i] = force.unsqueeze(1)
-            # unsqueeze to match force shape (env, 1, 3)
+
             zero_torque = torch.zeros(num_envs, 3, device=self.config.device).unsqueeze(1)
             wp_world_forces_working = wp.zeros(shape=(num_envs, 1), dtype=wp.vec3, device=self.config.device)
-            
-            # Simulation loop
+
             wall_time = start_time = time.time()
             data_done = False
             times_to_print = {}
             times_to_print["run_start"] = time.time() - run_start_time
             while_start_time = time.time()
             count = 0
-            
+
+            joint_pos_target = None
+            recorded_closed_pose = False
+            translation_tol = 0.05  # 5 cm
+
             while simulation_app.is_running():
-                # use the first frame to get the body positions from the initial joint positions
                 if count == 0:
                     gripper_state = gripper.data.default_root_state.clone()
                     if not USE_ORIGIN_PLACEMENT:
@@ -1052,158 +1059,185 @@ class GraspingSimulation:
                     gripper.write_root_pose_to_sim(gripper_state[:, :7])
                     gripper.write_root_velocity_to_sim(gripper_state[:, 7:])
 
-                    # Set object poses from grasp file
                     object_state = object.data.default_root_state.clone()
                     if not USE_ORIGIN_PLACEMENT:
                         object_state[:, :3] += scene.env_origins
                     object.write_root_pose_to_sim(object_state[:, :7])
                     object.write_root_velocity_to_sim(object_state[:, 7:])
-                    
-                    # Apply motion to gripper
-                    # joint state
-                    joint_pos = gripper.data.default_joint_pos.clone()#gripper.data.soft_joint_pos_limits[..., 1-grasp_mode].clone()##gripper.data.soft_joint_pos_limits[..., grasp_mode].clone() #gripper.data.default_joint_pos.clone()
-                    joint_vel = gripper.data.default_joint_vel.clone() #TODO get rid of the clone when we don't need to do it
+
+                    joint_pos = gripper.data.default_joint_pos.clone()
+                    joint_vel = gripper.data.default_joint_vel.clone()
                     self.get_initial_joint_pos(scene, joint_pos, num_envs, start_idx, buff)
-                    # NOTE:if the joint velocity limits are too low, then the joint positions won't jump to the correct
-                    # position.  They will have to slowly move there, even though write_joint_state_to_sim is supposed
-                    # to be a teleport command.
+
                     gripper.set_joint_position_target(joint_pos)
                     gripper.write_joint_state_to_sim(joint_pos, joint_vel)
-                    # Use joint_vel_limits if available, otherwise fall back to joint_velocity_limits
-                    if hasattr(gripper.data, 'joint_vel_limits'):
+
+                    if hasattr(gripper.data, "joint_vel_limits"):
                         temp_vel_limits = gripper.data.joint_vel_limits.clone()
-                        vel_limits = wp.array(gripper.data.joint_vel_limits.clone(), dtype=wp.float32, device=self.config.device)
+                        vel_limits = wp.array(
+                            gripper.data.joint_vel_limits.clone(),
+                            dtype=wp.float32,
+                            device=self.config.device,
+                        )
                     else:
                         temp_vel_limits = gripper.data.joint_velocity_limits.clone()
-                        vel_limits = wp.array(gripper.data.joint_velocity_limits.clone(), dtype=wp.float32, device=self.config.device)
+                        vel_limits = wp.array(
+                            gripper.data.joint_velocity_limits.clone(),
+                            dtype=wp.float32,
+                            device=self.config.device,
+                        )
+
                     vel_limits.fill_(1000000000.0)
                     gripper.write_joint_velocity_limit_to_sim(wp.to_torch(vel_limits, requires_grad=False))
                     scene.reset()
 
-                    # clear internal buffers
-
-                    for i in range(2):
+                    for _ in range(2):
                         scene.write_data_to_sim()
-                        # Perform step
                         sim.step(render=False)
-                        # Update buffers
                         scene.update(sim_dt)
-                        #print(".", end="", flush=True)
-                    
+
                     gripper.write_joint_velocity_limit_to_sim(temp_vel_limits)
                     gripper.write_joint_velocity_to_sim(joint_vel)
-                    
-                    #print("")
 
                 elif count == 1:
-                    #zero_vel = torch.zeros(num_envs, 6, device=self.config.device)
-                    #object.write_root_com_velocity_to_sim(zero_vel)
-                    # Set the initial conditions for the simulation.
-                    # zero the velocity of the object
                     sim_time = 0.0
+
                     gripper_state = gripper.data.default_root_state.clone()
                     if not USE_ORIGIN_PLACEMENT:
                         gripper_state[:, :3] += scene.env_origins
                     gripper.write_root_pose_to_sim(gripper_state[:, :7])
                     gripper.write_root_velocity_to_sim(gripper_state[:, 7:])
 
-                    # Set object poses from grasp file
                     root_state = object.data.default_root_state.clone()
                     wp.launch(
                         kernel=transform_inverse_kernel,
                         dim=num_envs,
                         inputs=[start_idx, 0, buff.pregrasp_transforms, root_state[:, :7], True],
-                        device=self.config.device)
+                        device=self.config.device,
+                    )
                     if not USE_ORIGIN_PLACEMENT:
                         root_state[:, :3] += scene.env_origins
                     object.write_root_pose_to_sim(root_state[:, :7])
                     object.write_root_velocity_to_sim(root_state[:, 7:])
 
-                
-                    # gripper should always be closing *
                     if self.config.disable_sim:
-                        joint_pos_target = joint_pos
+                        joint_pos_target = joint_pos.clone()
                     else:
-                        # Debug: Print joint limits and names for comparison between versions
-                        joint_pos_target = gripper.data.soft_joint_pos_limits[..., grasp_mode].clone()  # Closed position
-                    
-                    # Set joint position target
+                        joint_pos_target = gripper.data.soft_joint_pos_limits[..., grasp_mode].clone()
+
                     gripper.set_joint_position_target(joint_pos_target)
 
-                    # clear internal buffers
+                    # Wait this long for closure before tugging.
+                    force_start_time = sim_time + close_duration
+                    force_end_time = force_start_time + sum(seq[0] for seq in self.tug_sequences)
+
                     scene.reset()
                     times_to_print["reset"] = time.time() - while_start_time
-                    while_start_time = time.time()         # -- write data to sim
-                    
-                # Apply force to object if in force phase
-                if not data_done and sim_time >= force_start_time and sim_time < force_end_time and not self.config.disable_sim:
-                    # Calculate current sequence index based on time
-                    time_since_force_start = sim_time - force_start_time
-                    current_sequence = 0
-                    total_duration = 0.0
-                    
-                    for i, (duration, _, _) in enumerate(self.tug_sequences):
-                        if time_since_force_start < total_duration + duration:
-                            current_sequence = i
-                            break
-                        total_duration += duration
-                    wp.launch(
-                        kernel=world_to_object_force_kernel,
-                        dim=num_envs,
-                        inputs=[object.data.root_quat_w, wp_world_forces[current_sequence], wp_world_forces_working], 
-                        device=self.config.device)
-                    
-                    # Apply force to object (in local frame)
-                    object.set_external_force_and_torque(wp.to_torch(wp_world_forces_working,requires_grad=False), zero_torque)
+                    while_start_time = time.time()
 
-                elif sim_time >= force_end_time and not data_done and not self.config.disable_sim:
-                    times_to_print["while_loop"] = time.time() - while_start_time
-                    write_data_time = time.time()
-                    cdata0 = contact_forces0.data
-                    cdata1 = contact_forces1.data
-                    # Check if all finger tips have non-zero normal forces
-                    non_zero_forces0 = torch.all(torch.norm(cdata0.net_forces_w, dim=-1) > 0, dim=1)
-                    non_zero_forces1 = torch.all(torch.norm(cdata1.net_forces_w, dim=-1) > 0, dim=1)
-
-                    # This is an output
-                    non_zero_forces = non_zero_forces0 & non_zero_forces1
-                    wp.launch(
-                        kernel=set_is_success_kernel,
-                        dim=num_envs,
-                        inputs=[0, start_idx, non_zero_forces, buff.is_success],
-                        device=self.config.device)
-
+                # Record the "closed" relative pose once, right before tugging starts.
+                if (
+                    not data_done
+                    and joint_pos_target is not None
+                    and not recorded_closed_pose
+                    and sim_time >= force_start_time
+                ):
                     object_pos_rel = object.data.root_pos_w
                     object_quat_rel = object.data.root_quat_w
                     gripper_pos_w = gripper.data.root_pos_w
                     gripper_quat_w = gripper.data.root_quat_w
                     wp.launch(
                         kernel=compute_relative_pos_and_rot_kernel,
-                        dim =num_envs,
+                        dim=num_envs,
+                        inputs=[0, start_idx, object_pos_rel, object_quat_rel, gripper_pos_w, gripper_quat_w],
+                        outputs=[buff.closed_rel_transforms],
+                        device=self.config.device,
+                    )
+                    recorded_closed_pose = True
+
+                # Tugging phase
+                elif (
+                    not data_done
+                    and not self.config.disable_sim
+                    and sim_time >= force_start_time
+                    and sim_time < force_end_time
+                ):
+                    time_since_force_start = sim_time - force_start_time
+                    current_sequence = 0
+                    total_duration = 0.0
+
+                    for i, (duration, _, _) in enumerate(self.tug_sequences):
+                        if time_since_force_start < total_duration + duration:
+                            current_sequence = i
+                            break
+                        total_duration += duration
+
+                    wp.launch(
+                        kernel=world_to_object_force_kernel,
+                        dim=num_envs,
+                        inputs=[object.data.root_quat_w, wp_world_forces[current_sequence], wp_world_forces_working],
+                        device=self.config.device,
+                    )
+
+                    object.set_external_force_and_torque(
+                        wp.to_torch(wp_world_forces_working, requires_grad=False),
+                        zero_torque,
+                    )
+
+                # Finalize
+                elif (
+                    not data_done
+                    and sim_time >= force_end_time
+                    and recorded_closed_pose
+                ):
+                    object_pos_rel = object.data.root_pos_w
+                    object_quat_rel = object.data.root_quat_w
+                    gripper_pos_w = gripper.data.root_pos_w
+                    gripper_quat_w = gripper.data.root_quat_w
+
+                    wp.launch(
+                        kernel=compute_relative_pos_and_rot_kernel,
+                        dim=num_envs,
                         inputs=[0, start_idx, object_pos_rel, object_quat_rel, gripper_pos_w, gripper_quat_w],
                         outputs=[buff.transforms],
-                        device=self.config.device)
+                        device=self.config.device,
+                    )
+
                     wp.launch(
                         kernel=get_joint_pos_kernel,
                         dim=(num_envs, len(self.cspace_joint_names)),
                         inputs=[0, start_idx, gripper.data.joint_pos, self.cspace_joint_indices],
                         outputs=[buff.cspace_positions],
-                        device=self.config.device)
+                        device=self.config.device,
+                    )
+
                     if buff.bite_points is not None:
-                        finger_idx = self.bite_body_idx#gripper.data.body_names.index(self.finger_colliders[0])
-                        #bite_points_before = buff.bite_points.numpy()[start_idx:start_idx+num_envs].tolist()
-                        bite_point = wp.vec3(self.bite_point[0], self.bite_point[1], self.bite_point[2]) # TODO maybe don't bother with bite points, I'm not sure they are correct.
+                        finger_idx = self.bite_body_idx
+                        bite_point = wp.vec3(self.bite_point[0], self.bite_point[1], self.bite_point[2])
                         wp.launch(
                             kernel=get_body_pos_kernel,
                             dim=num_envs,
                             inputs=[0, start_idx, finger_idx, bite_point, gripper.data.body_link_pos_w, gripper_pos_w],
                             outputs=[buff.bite_points],
-                            device=self.config.device)
-                        #bite_points_after = buff.bite_points.numpy()[start_idx:start_idx+num_envs].tolist()
+                            device=self.config.device,
+                        )
 
-                    # we want to keep simming if the UI is open so the UI does not freeze
+                    # IMPORTANT: compute success only AFTER buff.transforms has been written.
+                    wp.launch(
+                        kernel=set_is_success_from_translation_drift_kernel,
+                        dim=num_envs,
+                        inputs=[
+                            start_idx,
+                            buff.closed_rel_transforms,
+                            buff.transforms,
+                            translation_tol,
+                            buff.is_success,
+                        ],
+                        device=self.config.device,
+                    )
+
                     data_done = True
-                    if do_render and self.force_headed:                    
+                    if do_render and self.force_headed:
                         print_purple(f"In {__file__}, waiting for Isaac Lab to close...", flush=True)
             
                         while simulation_app.is_running():
@@ -1221,6 +1255,7 @@ class GraspingSimulation:
                 scene.update(sim_dt)
                 # Update simulation time
                 sim_time += sim_dt
+
                 current_time = time.time()
                 if not data_done and int(current_time) > int(wall_time):
                     # Show simulation timing with batch info, overwriting the previous line cleanly
@@ -1229,10 +1264,18 @@ class GraspingSimulation:
                         percentage = int((sim_time / force_end_time) * 100) if force_end_time > 0 else 0
                         # Pad single-digit percentages to keep "Sim:" aligned
                         percentage_str = f" {percentage}%" if percentage < 10 else f"{percentage}%"
-                        # Clear the line completely and print fresh to avoid leftover characters
-                        print_purple(f"\r  🔄 Batch {batch_count}/{total_batches}: {percentage_str}    Sim: {sim_time:.1f}s / Real: {time.time()-start_time:.1f}s{' ' * 15}", end="", flush=True)
+                        print_purple(
+                            f"\r  🔄 Batch {batch_count}/{total_batches}: {percentage_str}    "
+                            f"Sim: {sim_time:.1f}s / Real: {time.time()-start_time:.1f}s{' ' * 15}",
+                            end="",
+                            flush=True,
+                        )
                     else:
-                        print(f"\r  ⏱️  Sim: {sim_time:.1f}s / Real: {time.time()-start_time:.1f}s{' ' * 20}", end="", flush=True)
+                        print(
+                            f"\r  ⏱️  Sim: {sim_time:.1f}s / Real: {time.time()-start_time:.1f}s{' ' * 20}",
+                            end="",
+                            flush=True,
+                        )
                     wall_time = current_time
 
 def main(args):
