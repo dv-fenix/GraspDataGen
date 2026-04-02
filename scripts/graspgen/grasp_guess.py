@@ -31,11 +31,11 @@ from gripper import Gripper, add_gripper_args, collect_gripper_args, apply_gripp
 from object import add_object_args, ObjectConfig, collect_object_args
 #wp.config.verify_cuda = True
 from warp_kernels import (
-    triangle_area, compute_transforms_from_random_samples, intersect_mesh_along_negative_normal,find_collision_axis_lengths, ingest_grasp_guess_data_kernel,
-    get_closest_offset_transforms_kernel, intersect_other_body_with_offsets, set_offsets_acronym, compute_acronym_transforms_from_random_samples, 
+    triangle_area, compute_transforms_from_random_samples, intersect_mesh_along_negative_normal, ingest_grasp_guess_data_kernel,
+    get_closest_offset_transforms_kernel, intersect_other_body_with_offsets, set_offsets_acronym, 
     intersect_with_offsets, get_finger1_success_count, get_finger1_successes, random_mesh_sample, get_body_transforms_acronym,
     get_body_transforms, body_to_object_raycast, center_transform_between_distances, invert_and_orient_grasps, copy_vec3, fill_are_offsets_invalid_kernel,
-    intersect_the_offsets_with_offsets, find_widest_valid_opening_kernel
+    intersect_the_offsets_with_offsets, find_widest_valid_opening_kernel, find_collision_axes_in_cone, compute_acronym_transforms_from_random_samples_cone
 )
 import numpy as np
 from datetime import datetime
@@ -53,7 +53,7 @@ default_num_offsets = 16
 default_do_not_center_finger_opening = False
 default_use_acronym_grasp_guess = False
 default_correct_acronym_approach = False
-default_max_guess_tries = 100
+default_max_guess_tries = 1000
 
 default_save_collision_mesh_folder = ""
 
@@ -503,6 +503,7 @@ class GraspGuessConfig:
         self.correct_acronym_approach = correct_acronym_approach
         self.max_guess_tries = max_guess_tries
         self.device = device
+        self.antipodal_cone_half_angle_rad = 0.175  # 20 degrees
 
 class GraspGuessGenerator:
     def __init__(self, config, gripper: Gripper):
@@ -823,7 +824,7 @@ class GraspGuessGenerator:
         while grasps_left[0] > 0 or grasps_left[1] > 0:
             # Check total tries limit first
             if total_tries >= max_total_tries or tries >= max_tries:
-                print(f"\nWarning: Reached maximum total tries ({max_total_tries}) or consecutive tries ({max_tries}) without finding enough grasps. Stopping generation.")
+                print(f"\nWarning: Reached maximum total tries ({max_total_tries}) or consecutive tries ({max_tries}) without finding enough grasps. Stopping generation for {object.config.object_file.split('/')[-1]}.")
                 print(f"Still needed: {grasps_left[0]} successes, {grasps_left[1]} fails")
                 break
                 
@@ -959,6 +960,7 @@ class GraspGuessGenerator:
         work_normals = wp.array(shape=self.num_true_random_grasps, dtype=wp.vec3, device=self.config.device)
         work_lengths = wp.array(shape=self.num_true_random_grasps, dtype=wp.float32, device=self.config.device)    
         root_transforms = wp.array(shape=self.num_grasps, dtype=wp.transform, device=self.config.device)
+        work_axis_dirs = wp.array(shape=self.num_true_random_grasps, dtype=wp.vec3, device=self.config.device)
         is_invalid = wp.array(shape=self.num_grasps, dtype=wp.int32, device=self.config.device)
 
         # acronym-pipeline/graspsampling-py/graspsampling/sampling.py ACRONYM Sampler
@@ -977,18 +979,40 @@ class GraspGuessGenerator:
         # center of the closing axis is based an the collision line segment from the sample point.  That line segment is
         # found by casting a ray from the sample point in the direction of the -normal, and then finding nearest and furthest point.
         # It uses the center of those points as the point that is pointed to by the approach direction.
-        wp.launch(kernel=find_collision_axis_lengths,
-                  dim=self.num_true_random_grasps,
-                  inputs=[object.mesh.id, work_points, work_normals],
-                  outputs=[work_lengths],
-                  device=self.config.device)
-        wp.launch(kernel=compute_acronym_transforms_from_random_samples,
-                  dim=self.num_true_random_grasps,
-                  inputs=[work_points, work_normals, self.gen_seed(), self.config.percent_random_guess_angle,
-                          work_lengths, self.gripper.num_openings, self.gripper.open_widths_reverse, self.gripper.open_configuration_offset, self.config.correct_acronym_approach,
-                          self.gripper.open_axis, True],
-                  outputs=[work_transforms, work_offsets],
-                  device=self.config.device)
+        wp.launch(
+            kernel=find_collision_axes_in_cone,
+            dim=self.num_true_random_grasps,
+            inputs=[
+                object.mesh.id,
+                work_points,
+                work_normals,
+                self.gen_seed(),
+                self.config.antipodal_cone_half_angle_rad,
+            ],
+            outputs=[work_axis_dirs, work_lengths],
+            device=self.config.device,
+        )
+
+        wp.launch(
+            kernel=compute_acronym_transforms_from_random_samples_cone,
+            dim=self.num_true_random_grasps,
+            inputs=[
+                work_points,
+                work_axis_dirs,   # <- use sampled antipodal axis, not raw normal
+                self.gen_seed(),
+                self.config.percent_random_guess_angle,
+                work_lengths,
+                self.gripper.num_openings,
+                self.gripper.open_widths_reverse,
+                self.gripper.open_configuration_offset,
+                self.config.correct_acronym_approach,
+                self.gripper.open_axis,
+                True,
+            ],
+            outputs=[work_transforms, work_offsets],
+            device=self.config.device,
+        )
+
         wp.launch(kernel=invert_and_orient_grasps,
                   dim=(self.num_true_random_grasps, self.config.num_orientations),
                   inputs=[work_transforms, self.num_true_random_grasps, self.config.num_orientations, self.gripper.open_axis, self.gen_seed()],

@@ -87,6 +87,173 @@ def find_widest_valid_opening_kernel(
                     break
         offsets[tid] = i
 
+# - - CRITICAL CHANGE - sampling direction from cone deviations
+@wp.kernel
+def find_collision_axes_in_cone(
+    mesh: wp.uint64,
+    points: wp.array(dtype=wp.vec3),
+    normals: wp.array(dtype=wp.vec3),
+    seed: wp.int32,
+    cone_half_angle_rad: wp.float32,
+    axis_dirs: wp.array(dtype=wp.vec3),
+    lengths: wp.array(dtype=wp.float32),
+):
+    """
+    For each sampled surface point x with normal n:
+      1) sample a direction d uniformly from the spherical cap / cone around n
+      2) cast a ray from x - offset*d along d
+      3) recover the chord length from x to the opposite hit as offset - query.t
+
+    Assumes watertight meshes and outward-pointing normals, matching the spirit
+    of the current normal-ray implementation.
+    """
+    tid = wp.tid()
+
+    x = points[tid]
+    n = wp.normalize(normals[tid])
+
+    rng = wp.rand_init(seed, tid)
+
+    # Uniform sample on spherical cap centered at +n.
+    # z = cos(theta) is uniform on [cos(alpha), 1].
+    u1 = wp.randf(rng)
+    u2 = wp.randf(rng)
+
+    cos_alpha = wp.cos(cone_half_angle_rad)
+    z = 1.0 - u1 * (1.0 - cos_alpha)
+
+    rr = 1.0 - z * z
+    if rr < 0.0:
+        rr = 0.0
+    r = wp.sqrt(rr)
+
+    phi = 2.0 * wp.pi * u2
+
+    # Build an orthonormal basis (t, b, n).
+    helper = wp.vec3(0.0, 0.0, 1.0)
+    if wp.abs(n[2]) > 0.999:
+        helper = wp.vec3(0.0, 1.0, 0.0)
+
+    t = wp.normalize(wp.cross(helper, n))
+    b = wp.cross(n, t)
+
+    d = t * (r * wp.cos(phi)) + b * (r * wp.sin(phi)) + n * z
+    d = wp.normalize(d)
+
+    # Numerical safety: keep the sampled direction in the same hemisphere as n.
+    if wp.dot(d, n) < 0.0:
+        d = -d
+
+    offset = 2.0  # matches your current "come from the far side" trick
+    ray_origin = x - d * offset
+    ray_dir = d
+
+    query = wp.mesh_query_ray(mesh, ray_origin, ray_dir, wp.inf)
+
+    if query.result:
+        axis_dirs[tid] = d
+        lengths[tid] = offset - query.t
+    else:
+        # Conservative fallback.
+        axis_dirs[tid] = n
+        lengths[tid] = 0.0
+
+
+@wp.kernel
+def compute_acronym_transforms_from_random_samples_cone(
+    points: wp.array(dtype=wp.vec3),
+    axis_dirs: wp.array(dtype=wp.vec3),
+    seed: wp.int32,
+    percent_random: wp.float32,
+    axes_lengths: wp.array(dtype=wp.float32),
+    num_openings: wp.int32,
+    open_widths_reverse: wp.array(dtype=wp.float32),
+    open_configuration_offset: wp.int32,
+    correct_acronym_approach: wp.bool,
+    open_axis: wp.int32,
+    negative_normal: wp.bool,
+    transforms: wp.array(dtype=wp.mat44),
+    offsets: wp.array(dtype=wp.int32),
+):
+    """
+    Same logic as your current kernel, except the grasp axis is now the sampled
+    cone direction rather than the raw surface normal.
+    """
+    id = wp.tid()
+    rng = wp.rand_init(seed, id)
+
+    x = points[id]
+    d = wp.normalize(axis_dirs[id])
+
+    length = axes_lengths[id]
+
+    if correct_acronym_approach:
+        offset_reverse = wp.lower_bound(open_widths_reverse, length)
+
+        # Clamp in case lower_bound returns num_openings.
+        if offset_reverse < 0:
+            offset_reverse = 0
+        if offset_reverse >= num_openings:
+            offset_reverse = num_openings - 1
+
+        offsets[id] = num_openings - 1 - offset_reverse
+    else:
+        offsets[id] = open_configuration_offset
+        offset_reverse = num_openings - 1 - open_configuration_offset
+
+    # Same centering / standoff logic as your current implementation.
+    standoff = 0.50 * (open_widths_reverse[offset_reverse] - length)
+    x = x + d * standoff
+
+    # Preserve your current sign convention:
+    # translate along +d first, then optionally flip the axis used to orient the frame.
+    if negative_normal:
+        d = -d
+
+    contact_transform = wp_plane_transform_axis(x, d, open_axis)
+
+    rand_num = wp.randf(rng)
+    angle = rand_num * wp.tau - wp.pi
+
+    random_chance = wp.randf(rng)
+    if random_chance >= percent_random:
+        which_angle = id % 4
+        if which_angle == 0:
+            angle = -wp.pi
+        elif which_angle == 1:
+            angle = -wp.pi / 2.0
+        elif which_angle == 2:
+            angle = 0.0
+        else:
+            angle = wp.pi / 2.0
+
+    rot_trans = wp.mat44(
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    )
+
+    # Rotate around the specified grasp axis, exactly as before.
+    if open_axis == 0:
+        rot_trans[1, 1] = wp.cos(angle)
+        rot_trans[1, 2] = -wp.sin(angle)
+        rot_trans[2, 1] = wp.sin(angle)
+        rot_trans[2, 2] = wp.cos(angle)
+    elif open_axis == 1:
+        rot_trans[0, 0] = wp.cos(angle)
+        rot_trans[0, 2] = wp.sin(angle)
+        rot_trans[2, 0] = -wp.sin(angle)
+        rot_trans[2, 2] = wp.cos(angle)
+    else:
+        rot_trans[0, 0] = wp.cos(angle)
+        rot_trans[0, 1] = -wp.sin(angle)
+        rot_trans[1, 0] = wp.sin(angle)
+        rot_trans[1, 1] = wp.cos(angle)
+
+    T = rot_trans @ contact_transform
+    transforms[id] = T
+
 @wp.kernel
 def get_body_transforms_acronym(
     body_transforms: wp.array(dtype=wp.mat44),
